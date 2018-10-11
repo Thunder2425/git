@@ -13,6 +13,19 @@
 
 static const int delay[] = { 0, 1, 10, 20, 40 };
 
+void open_in_gdb(void)
+{
+	static struct child_process cp = CHILD_PROCESS_INIT;
+	extern char *_pgmptr;
+
+	argv_array_pushl(&cp.args, "mintty", "gdb", NULL);
+	argv_array_pushf(&cp.args, "--pid=%d", getpid());
+	cp.clean_on_exit = 1;
+	if (start_command(&cp) < 0)
+		die_errno("Could not start gdb");
+	sleep(1);
+}
+
 int err_win_to_posix(DWORD winerr)
 {
 	int error = ENOSYS;
@@ -440,8 +453,19 @@ static int mingw_open_append(wchar_t const *wfilename, int oflags, ...)
 	handle = CreateFileW(wfilename, FILE_APPEND_DATA,
 			FILE_SHARE_WRITE | FILE_SHARE_READ,
 			NULL, create, FILE_ATTRIBUTE_NORMAL, NULL);
-	if (handle == INVALID_HANDLE_VALUE)
-		return errno = err_win_to_posix(GetLastError()), -1;
+	if (handle == INVALID_HANDLE_VALUE) {
+		DWORD err = GetLastError();
+		/*
+		 * Some network storage solutions (e.g. Isilon) might return
+		 * ERROR_INVALID_PARAMETER instead of expected error
+		 * ERROR_PATH_NOT_FOUND, which results in a unknow error. If
+		 * so, the error is now forced to be an ERROR_PATH_NOT_FOUND
+		 * error instead.
+		 */
+		if (err == ERROR_INVALID_PARAMETER)
+			err = ERROR_PATH_NOT_FOUND;
+		return errno = err_win_to_posix(err), -1;
+	}
 
 	/*
 	 * No O_APPEND here, because the CRT uses it only to reset the
@@ -941,11 +965,19 @@ unsigned int sleep (unsigned int seconds)
 char *mingw_mktemp(char *template)
 {
 	wchar_t wtemplate[MAX_PATH];
+	int offset = 0;
+
 	if (xutftowcs_path(wtemplate, template) < 0)
 		return NULL;
+
+	if (is_dir_sep(template[0]) && !is_dir_sep(template[1]) &&
+	    iswalpha(wtemplate[0]) && wtemplate[1] == L':') {
+		/* We have an absolute path missing the drive prefix */
+		offset = 2;
+	}
 	if (!_wmktemp(wtemplate))
 		return NULL;
-	if (xwcstoutf(template, wtemplate, strlen(template) + 1) < 0)
+	if (xwcstoutf(template, wtemplate + offset, strlen(template) + 1) < 0)
 		return NULL;
 	return template;
 }
@@ -1422,6 +1454,7 @@ static pid_t mingw_spawnve_fd(const char *cmd, const char **argv, char **deltaen
 	HANDLE cons;
 	const char *(*quote_arg)(const char *arg) =
 		is_msys2_sh(*argv) ? quote_arg_msys2 : quote_arg_msvc;
+	const char *strace_env;
 
 	if (restrict_handle_inheritance < 0)
 		restrict_handle_inheritance = core_restrict_inherited_handles;
@@ -1500,6 +1533,31 @@ static pid_t mingw_spawnve_fd(const char *cmd, const char **argv, char **deltaen
 		strbuf_addstr(&args, quoted);
 		if (quoted != *argv)
 			free(quoted);
+	}
+
+	strace_env = getenv("GIT_STRACE_COMMANDS");
+	if (strace_env) {
+		char *p = path_lookup("strace.exe", 1);
+		if (!p)
+			return error("strace not found!");
+		if (xutftowcs_path(wcmd, p) < 0) {
+			free(p);
+			return -1;
+		}
+		free(p);
+		if (!strcmp("1", strace_env) ||
+		    !strcasecmp("yes", strace_env) ||
+		    !strcasecmp("true", strace_env))
+			strbuf_insert(&args, 0, "strace ", 7);
+		else {
+			const char *quoted = quote_arg(strace_env);
+			struct strbuf buf = STRBUF_INIT;
+			strbuf_addf(&buf, "strace -o %s ", quoted);
+			if (quoted != strace_env)
+				free((char *)quoted);
+			strbuf_insert(&args, 0, buf.buf, buf.len);
+			strbuf_release(&buf);
+		}
 	}
 
 	ALLOC_ARRAY(wargs, st_add(st_mult(2, args.len), 1));
@@ -2347,6 +2405,28 @@ pid_t waitpid(pid_t pid, int *status, int options)
 	return -1;
 }
 
+int mingw_is_mount_point(struct strbuf *path)
+{
+	WIN32_FIND_DATAW findbuf = { 0 };
+	HANDLE handle;
+	wchar_t wfilename[MAX_PATH];
+	int wlen = xutftowcs_path(wfilename, path->buf);
+	if (wlen < 0)
+		die(_("could not get long path for '%s'"), path->buf);
+
+	/* remove trailing slash, if any */
+	if (wlen > 0 && wfilename[wlen - 1] == L'/')
+		wfilename[--wlen] = L'\0';
+
+	handle = FindFirstFileW(wfilename, &findbuf);
+	if (handle == INVALID_HANDLE_VALUE)
+		return 0;
+	FindClose(handle);
+
+	return (findbuf.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+		(findbuf.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT);
+}
+
 int xutftowcsn(wchar_t *wcs, const char *utfs, size_t wcslen, int utflen)
 {
 	int upos = 0, wpos = 0;
@@ -2603,6 +2683,7 @@ int wmain(int argc, const wchar_t **wargv)
 #endif
 
 	maybe_redirect_std_handles();
+	fsync_object_files = 1;
 
 	/* determine size of argv and environ conversion buffer */
 	maxlen = wcslen(wargv[0]);
